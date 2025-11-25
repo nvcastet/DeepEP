@@ -198,11 +198,13 @@ __global__ __launch_bounds__(1024, 1) void
 dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
+         float* packed_recv_topk_weights,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
          const float* x_global_scale,
          void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
          const void* x, const int64_t* topk_idx,
+         const float* topk_weights,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
          int* next_clean, int num_next_clean_int,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
@@ -266,12 +268,17 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
+            const auto rdma_x_topk_weight = rdma_x_src_idx + 1;  // Use first reserved field
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
             const auto rdma_x_scales = reinterpret_cast<rdma_x_scale_t*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
+            if (warp_id < num_topk and lane_id == 0) {
+                *rdma_x_topk_weight = __ldg(reinterpret_cast<const int*>(topk_weights) + token_idx * num_topk + warp_id);
+            }
+
             float SFScaleVal = 1.0f;
             if constexpr (kUseNVFP4) {
                 // Get scaling value;
@@ -448,6 +455,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         const auto recv_x_int4 = static_cast<int4*>(packed_recv_x) +
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+        const auto recv_topk_weights = packed_recv_topk_weights != nullptr ? reinterpret_cast<int*>(packed_recv_topk_weights) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank : nullptr;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_tokens = align_up<int>(num_ranks * num_max_dispatch_tokens_per_rank, 128);
         const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
@@ -484,8 +492,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
-            if (lane_id == 0)
+            if (lane_id == 0) {
                 recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
+                // Copy topk_weight if output buffer is provided
+                if (recv_topk_weights != nullptr) {
+                    recv_topk_weights[recv_token_begin_idx + i] = ld_nc_global(src_src_idx + 1);
+                }
+            }
             __syncwarp();
 
             // Copy data
@@ -516,12 +529,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                     auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32));
                     recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
                 }
-            } else if constexpr (kUseNVFP4) {            
+            } else if constexpr (kUseNVFP4) {
                  // The physical layout is (l, rm, rk, 32, 4, 4)
                 const auto src_scales = reinterpret_cast<uint8_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
                 const auto token_idx = recv_token_begin_idx + i;
-                
+
                 const auto rk = align_up<int>(kHidden / kNumPerChannels, 4) / 4;
                 const auto dim0_stride = rk * 128 * num_elems_per_pack;
                 const auto dim1_stride = 128 * num_elems_per_pack;
@@ -548,11 +561,13 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
 void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count,
+              float* packed_recv_topk_weights,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               const float* x_global_scale,
               void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
               const void* x, const int64_t* topk_idx,
+              const float* topk_weights,
               int* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks,
@@ -593,11 +608,13 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
+              packed_recv_topk_weights, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
               x_global_scale, \
               rdma_recv_x, rdma_recv_count, rdma_x, \
               x, topk_idx, \
+              topk_weights, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean, num_next_clean_int, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
