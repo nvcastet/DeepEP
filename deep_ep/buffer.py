@@ -701,13 +701,16 @@ class Buffer:
             recv_topk_weights: (Only returned if `topk_weights` was provided) tensor shaped
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks]` with type `torch.float32`,
                 containing the received topk weights for each token.
+            recv_rank_info: (Only returned if `topk_weights` was provided) tensor shaped
+                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks]` with type `torch.int32`,
+                containing the source rank for each received token.
             handle: the communication handle to be used in the `low_latency_combine` function.
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
 
-            Note: Returns 5 elements when `topk_weights=None`, 6 elements when `topk_weights` is provided.
+            Note: Returns 5 elements when `topk_weights=None`, 7 elements when `topk_weights` is provided.
         """
-        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, packed_recv_topk_weights, event, hook = \
+        packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, packed_recv_topk_weights, packed_recv_rank_info, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               topk_weights,
                                               cumulative_local_expert_recv_stats,
@@ -721,7 +724,7 @@ class Buffer:
         tensors_to_record = (x, topk_idx,
                              packed_recv_x, packed_recv_x_scales, packed_recv_count,
                              packed_recv_src_info, packed_recv_layout_range,
-                             packed_recv_topk_weights,
+                             packed_recv_topk_weights, packed_recv_rank_info,
                              cumulative_local_expert_recv_stats,
                              x_global_scale)
         if use_fp8 or use_nvfp4:
@@ -729,7 +732,7 @@ class Buffer:
 
         # Return format depends on whether topk_weights was provided (backward compatibility)
         if topk_weights is not None:
-            return packed_recv_x, packed_recv_count, packed_recv_topk_weights, handle, \
+            return packed_recv_x, packed_recv_count, packed_recv_topk_weights, packed_recv_rank_info, handle, \
                 EventOverlap(event, tensors_to_record if async_finish else None), hook
         else:
             return packed_recv_x, packed_recv_count, handle, \

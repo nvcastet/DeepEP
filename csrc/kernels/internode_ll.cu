@@ -199,6 +199,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count,
          float* packed_recv_topk_weights,
+         int* packed_recv_rank_info,
          int* cumulative_local_expert_recv_stats,
          int64_t* dispatch_wait_recv_cost_stats,
          const float* x_global_scale,
@@ -456,6 +457,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                 local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_int4;
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_topk_weights = packed_recv_topk_weights != nullptr ? reinterpret_cast<int*>(packed_recv_topk_weights) + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank : nullptr;
+        const auto recv_rank_info = packed_recv_rank_info != nullptr ? packed_recv_rank_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank : nullptr;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_tokens = align_up<int>(num_ranks * num_max_dispatch_tokens_per_rank, 128);
         const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
@@ -494,9 +496,12 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
             if (lane_id == 0) {
                 recv_src_info[recv_token_begin_idx + i] = ld_nc_global(src_src_idx);
-                // Copy topk_weight if output buffer is provided
+                // Copy topk_weight and rank_info if output buffers are provided
                 if (recv_topk_weights != nullptr) {
                     recv_topk_weights[recv_token_begin_idx + i] = ld_nc_global(src_src_idx + 1);
+                }
+                if (recv_rank_info != nullptr) {
+                    recv_rank_info[recv_token_begin_idx + i] = src_rank;
                 }
             }
             __syncwarp();
@@ -562,6 +567,7 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count,
               float* packed_recv_topk_weights,
+              int* packed_recv_rank_info,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
               const float* x_global_scale,
@@ -609,6 +615,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, \
               packed_recv_topk_weights, \
+              packed_recv_rank_info, \
               cumulative_local_expert_recv_stats, \
               dispatch_wait_recv_cost_stats, \
               x_global_scale, \
