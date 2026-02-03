@@ -276,7 +276,7 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
-            if (warp_id < num_topk and lane_id == 0) {
+            if (warp_id < num_topk and lane_id == 0 and topk_weights != nullptr) {
                 *rdma_x_topk_weight = __ldg(reinterpret_cast<const int*>(topk_weights) + token_idx * num_topk + warp_id);
             }
 
