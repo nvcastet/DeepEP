@@ -269,15 +269,15 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
-            const auto rdma_x_topk_weight = rdma_x_src_idx + 1;  // Use first reserved field
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
             const auto rdma_x_scales = reinterpret_cast<rdma_x_scale_t*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
+            int my_topk_weight_bits = 0;
             if (warp_id < num_topk and lane_id == 0 and topk_weights != nullptr) {
-                *rdma_x_topk_weight = __ldg(reinterpret_cast<const int*>(topk_weights) + token_idx * num_topk + warp_id);
+                my_topk_weight_bits = __ldg(reinterpret_cast<const int*>(topk_weights) + token_idx * num_topk + warp_id);
             }
 
             float SFScaleVal = 1.0f;
@@ -355,12 +355,16 @@ dispatch(void* packed_recv_x, void* packed_recv_x_scales,
                                      slot_idx * num_bytes_per_msg;
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (dst_p2p_ptr == 0) {
+                    EP_DEVICE_ASSERT(topk_weights == nullptr);
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
                 } else {
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    if (lane_id == 0)
+                        st_na_global(dst_int4_ptr, make_int4(token_idx, my_topk_weight_bits, 0, 0));
+                    // Copy payload (skip header)
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg - 1, dst_int4_ptr + 1, src_int4_ptr + 1, ld_nc_global, st_na_global);
                 }
 
                 // Increase counter after finishing
